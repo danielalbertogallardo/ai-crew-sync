@@ -5723,8 +5723,9 @@ async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profi
 /// left closed, or a laptop asleep, past the credential's lifetime) gets the
 /// bus back: the proxy registers the same session label again with the
 /// agent token, as the bus's own refusal says to, instead of starting with
-/// no bus at all. Only expiry does this; a revoked or replaced credential
-/// still fails closed.
+/// no bus at all. A revoked credential does the same (#214); a label that is
+/// still live under a secret this window does not hold is refused by the
+/// bus, with the way out in the refusal.
 #[tokio::test]
 async fn a_window_whose_credential_expired_registers_again_on_resume() {
     let h = require_db!("t_expired_resume");
@@ -5761,8 +5762,10 @@ async fn a_window_whose_credential_expired_registers_again_on_resume() {
     assert_eq!(who["session"], before["session"]);
     let _ = resumed.cancel().await;
 
-    // A revoked credential is not an expired one: the window stays off the
-    // bus rather than registering its way around the revocation.
+    // Revoked (`revoke_session` from a terminal, say): the stored secret is
+    // dead, and reloading it forever left the conversation with no way
+    // back but a new one (#214). The agent token registers the label again,
+    // exactly as `register_session` allows for a revoked one.
     sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
         .execute(&h.pool)
         .await
@@ -5770,10 +5773,103 @@ async fn a_window_whose_credential_expired_registers_again_on_resume() {
     let revoked = spawn_proxy(&dir, &repo, &[], &conv).await;
     let status = call(&revoked, "session_status", json!({})).await;
     assert_eq!(
-        status["connected"], false,
-        "a revoked window registered again: {status}"
+        status["connected"], true,
+        "a revoked window did not register again: {status}"
     );
+    assert_eq!(status["session"], before["session"], "{status}");
+    let who = call(&revoked, "whoami", json!({})).await;
+    assert_eq!(who["session"], before["session"]);
     let _ = revoked.cancel().await;
+
+    // Rotated by a process this file never heard of, and still live: the
+    // bus will not hand that window to the agent token. The window stays
+    // off the bus and says how to close the other one.
+    sqlx::query(
+        "UPDATE agent_sessions SET token_hash = 'rotated-elsewhere' WHERE revoked_at IS NULL",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let rotated = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&rotated, "session_status", json!({})).await;
+    assert_eq!(
+        status["connected"], false,
+        "a live window was taken back with the agent token: {status}"
+    );
+    let reason = status["error"].as_str().unwrap_or_default();
+    assert!(reason.contains("still live"), "{status}");
+    assert!(
+        reason.contains("client call revoke_session"),
+        "the refusal names the way out: {status}"
+    );
+    let _ = rotated.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// `resume_session` called by the model through the proxy rotates the very
+/// secret the proxy sends. The proxy keeps the new one — for its own calls,
+/// for its hooks' binding and for the next restart of the conversation —
+/// and the result describes the credential without carrying it (#214).
+#[tokio::test]
+async fn resume_session_through_the_proxy_keeps_the_rotated_credential() {
+    let h = require_db!("t_proxy_resume_tool");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-tool")];
+    let stored = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+                &dir,
+                "conv-resume-tool",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let before = stored();
+
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert!(
+        resumed.get("session_token").is_none(),
+        "the secret reached the tool result"
+    );
+    assert!(!resumed.to_string().contains("acss_"), "{resumed}");
+    assert_eq!(resumed["session"], status["session"], "{resumed}");
+    assert_eq!(
+        resumed["epoch"].as_i64(),
+        before["epoch"].as_i64().map(|e| e + 1),
+        "{resumed}"
+    );
+
+    // The window keeps working on the rotated credential.
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(who["session"], status["session"], "{who}");
+    assert_eq!(who["session_identity"]["epoch"], resumed["epoch"], "{who}");
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+
+    // And so does what reads the binding: it holds the new secret.
+    let after = stored();
+    assert_eq!(after["epoch"], resumed["epoch"], "{after}");
+    assert_ne!(after["session_token"], before["session_token"]);
+    let _ = window.cancel().await;
+
+    // A restart of the conversation resumes with it.
+    let again = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&again, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let who = call(&again, "whoami", json!({})).await;
+    assert_eq!(who["session"], resumed["session"], "{who}");
+    let _ = again.cancel().await;
 
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;

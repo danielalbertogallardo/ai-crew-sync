@@ -783,6 +783,15 @@ ends it early. A renewal the bus refuses is reported by `session_status` as
 a rejected credential, never papered over with another identity. A bus too old to issue
 credentials simply keeps the label-only connection.
 
+When the stored credential no longer works on reconnect — expired, revoked,
+or rotated by something this window never heard from — the proxy registers
+the same label again with the agent token. The bus still decides: a label
+that is still live under a secret this window does not hold is refused, and
+the refusal says how to close it (`revoke_session` with its label, from
+another window or `ai-crew-sync client call`). `resume_session` called
+through the proxy is run by the proxy itself, which keeps the rotated
+credential and returns its description without the secret.
+
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
 (Claude Code sets it on MCP server processes), the `_meta.threadId` Codex
