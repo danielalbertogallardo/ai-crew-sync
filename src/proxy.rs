@@ -236,17 +236,41 @@ struct State {
     /// A credential `resume_session` rotated whose new secret could not open
     /// a connection. The context it belonged to is retired, and this keeps
     /// the binding holding the new secret so a restart resumes with it.
-    stranded: Option<Stranded>,
+    /// It is still this window's identity: read it through
+    /// [`State::identity`], never through `connected` alone.
+    stranded: Option<Identity>,
 }
 
-/// What the binding needs of a retired context to reconnect it.
+/// Who this window is on the bus: the agent, team and credential it speaks
+/// as, whether or not a connection is open right now.
 #[derive(Clone)]
-struct Stranded {
+struct Identity {
     profile: Option<String>,
     agent: String,
     team: String,
     mcp_url: String,
-    proof: SessionProof,
+    proof: Option<SessionProof>,
+}
+
+impl State {
+    /// This window's identity: the connected context, else the one a
+    /// failed adoption retired. Every check of team, ownership or
+    /// credential reads it here: a window that lost its connection is
+    /// still bound to its team and still owns its binding, and a check
+    /// that looked only at `connected` would treat it as nobody.
+    fn identity(&self) -> Option<Identity> {
+        match (&self.connected, &self.stranded) {
+            (Some(c), _) => Some(Identity {
+                profile: c.resolved.profile.clone(),
+                agent: c.agent.clone(),
+                team: c.team.clone(),
+                mcp_url: c.resolved.mcp_url.clone(),
+                proof: c.proof.clone(),
+            }),
+            (None, Some(s)) => Some(s.clone()),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Counts calls currently forwarded; decremented on drop so a request the
@@ -1116,10 +1140,12 @@ impl Proxy {
 
         // A team switch would let one conversation carry another team's
         // transcript into this one. The credential was verified and is
-        // dropped unused.
+        // dropped unused. Checked against the window's identity, not its
+        // connection: a window off the bus after a failed adoption has the
+        // same transcript and is bound to the same team.
         {
             let st = self.state.read().await;
-            if let Some(old) = &st.connected
+            if let Some(old) = st.identity()
                 && old.team != team
             {
                 let _ = remote.cancel().await;
@@ -1257,22 +1283,16 @@ impl Proxy {
         let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
         // The connected context, else the one a failed adoption retired:
         // its secret is the only one the bus still accepts for this window.
-        let (profile, agent, team, mcp_url, proof) = match (&st.connected, &st.stranded) {
-            (Some(c), _) => (
-                c.resolved.profile.clone(),
-                Some(c.agent.clone()),
-                Some(c.team.clone()),
-                Some(c.resolved.mcp_url.clone()),
-                c.proof.clone(),
+        let identity = st.identity();
+        let (profile, agent, team, mcp_url, proof) = match identity {
+            Some(i) => (
+                i.profile,
+                Some(i.agent),
+                Some(i.team),
+                Some(i.mcp_url),
+                i.proof,
             ),
-            (None, Some(s)) => (
-                s.profile.clone(),
-                Some(s.agent.clone()),
-                Some(s.team.clone()),
-                Some(s.mcp_url.clone()),
-                Some(s.proof.clone()),
-            ),
-            (None, None) => (None, None, None, None, None),
+            None => (None, None, None, None, None),
         };
         // The credential goes in here, which is why the file is 0600 inside a
         // 0700 directory and why `context hook` is the only thing that reads
@@ -1446,12 +1466,14 @@ impl Proxy {
             st.binding = Binding::RequestMeta;
             st.session = session_for(&host_id);
         }
+        // The profile this window speaks as, connected or not: a window off
+        // the bus reconnects as itself, not as the startup default.
         let inputs = {
             let st = self.state.read().await;
-            match &st.connected {
-                Some(c) => {
+            match st.identity() {
+                Some(id) => {
                     let mut i = self.opts.inputs.clone();
-                    i.profile = c.resolved.profile.clone();
+                    i.profile = id.profile;
                     i
                 }
                 None => self.opts.inputs.clone(),
@@ -1864,12 +1886,12 @@ impl Proxy {
                     // collect refusals while reporting a healthy window. It
                     // is retired, and the new credential stays in the
                     // binding, where a restart resumes with it.
-                    st.stranded = Some(Stranded {
+                    st.stranded = Some(Identity {
                         profile: c.resolved.profile.clone(),
                         agent: c.agent.clone(),
                         team: c.team.clone(),
                         mcp_url: c.resolved.mcp_url.clone(),
-                        proof: proof.clone(),
+                        proof: Some(proof.clone()),
                     });
                     let said = format!(
                         "the session was resumed and the bus rotated this window's credential, \
@@ -2218,10 +2240,13 @@ impl Proxy {
         let (key, mine) = {
             let st = self.state.read().await;
             let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
-            let mine = st
-                .connected
-                .as_ref()
-                .and_then(|c| c.proof.as_ref().map(|p| (p.session_id.clone(), p.epoch)));
+            // The window's identity, not its connection: one retired by a
+            // failed adoption still owns the record it wrote, and only that
+            // record. A window with no identity at all wrote none.
+            let Some(identity) = st.identity() else {
+                return;
+            };
+            let mine = identity.proof.map(|p| (p.session_id, p.epoch));
             (key, mine)
         };
         let path = context::binding_path(&self.opts.state_dir, &key);

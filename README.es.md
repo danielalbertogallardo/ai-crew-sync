@@ -819,6 +819,9 @@ credencial rotada y devuelve su descripción sin el secreto. Ahí no acepta
 (`BUS_SESSION_TTL_SECS`). Si la credencial rotada no consigue abrir una
 conexión, el proxy la guarda, sale del bus en vez de seguir con el secreto
 rechazado, y lo dice; al reiniciar el servidor MCP reconecta con ella.
+Fuera del bus la ventana sigue siendo la misma identidad: no puede cambiar a
+un perfil de otro equipo, y al salir solo cierra un binding que conserve la
+credencial que guardó.
 
 **Identidad de la conversación**, por orden: `--host-session` /
 `BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),

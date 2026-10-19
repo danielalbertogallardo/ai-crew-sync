@@ -795,6 +795,9 @@ credential and returns its description without the secret. It takes no
 with (`BUS_SESSION_TTL_SECS`). If the rotated credential cannot open a
 connection, the proxy saves it, leaves the bus instead of serving on the
 refused secret, and says so; restarting the MCP server reconnects with it.
+Off the bus, the window is still the same identity: it cannot switch to
+another team's profile, and on exit it only closes a binding that still holds
+the credential it saved.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
