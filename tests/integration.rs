@@ -6036,6 +6036,50 @@ async fn a_resume_whose_new_credential_cannot_connect_does_not_report_a_healthy_
     h.shutdown().await;
 }
 
+/// The proxy runs `resume_session` itself, and the credential it holds is
+/// renewed with the lifetime the window is configured with. A lifetime
+/// asked for on the call would be undone by the next renewal, so it is not
+/// advertised and is refused, without resuming anything.
+#[tokio::test]
+async fn resume_session_through_the_proxy_refuses_a_lifetime_of_its_own() {
+    let h = require_db!("t_proxy_resume_ttl");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-ttl")];
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+
+    let tools = window.list_all_tools().await.unwrap();
+    let resume = tools
+        .iter()
+        .find(|t| t.name == "resume_session")
+        .expect("resume_session is served");
+    assert!(
+        resume.input_schema["properties"]
+            .get("ttl_seconds")
+            .is_none(),
+        "{:?}",
+        resume.input_schema
+    );
+    assert_eq!(resume.input_schema["additionalProperties"], false);
+
+    let before = call(&window, "whoami", json!({})).await;
+    let said = call_expect_error(&window, "resume_session", json!({"ttl_seconds": 60})).await;
+    assert!(said.contains("ttl_seconds is not accepted"), "{said}");
+    assert!(said.contains("nothing was resumed"), "{said}");
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(
+        who["session_identity"]["epoch"], before["session_identity"]["epoch"],
+        "the refused call rotated the credential: {who}"
+    );
+
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 /// A host on protocol `2026-07-28` rejects a list without `ttlMs` and
 /// `cacheScope`, and a call result without `resultType`; Claude Code 2.1.281
 /// then shows the proxy connected with no tools (#192). The forwarded result

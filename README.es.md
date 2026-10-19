@@ -814,10 +814,11 @@ una etiqueta que sigue viva con un secreto que esta ventana no tiene se
 rechaza, y el rechazo dice cómo cerrarla (`revoke_session` con su etiqueta,
 desde otra ventana o con `ai-crew-sync client call`). `resume_session`
 llamado a través del proxy lo ejecuta el propio proxy, que se queda con la
-credencial rotada y devuelve su descripción sin el secreto. Si la credencial
-rotada no consigue abrir una conexión, el proxy la guarda, sale del bus en
-vez de seguir con el secreto rechazado, y lo dice; al reiniciar el servidor
-MCP reconecta con ella.
+credencial rotada y devuelve su descripción sin el secreto. Ahí no acepta
+`ttl_seconds`: la credencial conserva la vida con la que la ventana la renueva
+(`BUS_SESSION_TTL_SECS`). Si la credencial rotada no consigue abrir una
+conexión, el proxy la guarda, sale del bus en vez de seguir con el secreto
+rechazado, y lo dice; al reiniciar el servidor MCP reconecta con ella.
 
 **Identidad de la conversación**, por orden: `--host-session` /
 `BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),

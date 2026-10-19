@@ -2322,6 +2322,44 @@ async fn report_holdings(
     }
 }
 
+/// Why `resume_session` with a lifetime of its own is refused here.
+const RESUME_TTL_REFUSED: &str = "resume_session: through this proxy a resumed credential keeps \
+     the lifetime this window renews it with (BUS_SESSION_TTL_SECS, else the bus default), so \
+     ttl_seconds is not accepted and nothing was resumed; call it without ttl_seconds";
+
+/// A bus tool as this proxy serves it. `resume_session` is run by the
+/// proxy, and its credential lives as long as every other one the window
+/// holds: register, resume and each renewal ask for `BUS_SESSION_TTL_SECS`,
+/// and the renewal schedule is computed from it. A lifetime asked for on one
+/// call would last until the next renewal, so the proxy does not advertise
+/// `ttl_seconds` and refuses it.
+fn as_proxied(mut tool: Tool) -> Tool {
+    if tool.name != "resume_session" {
+        return tool;
+    }
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.remove("ttl_seconds");
+    }
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|r| r != "ttl_seconds");
+    }
+    schema.insert("additionalProperties".into(), Value::Bool(false));
+    tool.input_schema = Arc::new(schema);
+    let said = tool.description.as_deref().unwrap_or_default();
+    tool.description = Some(
+        format!(
+            "{said} Through this proxy, the proxy runs the resume and keeps the new secret; \
+             the lifetime is this window's (BUS_SESSION_TTL_SECS), so ttl_seconds is not \
+             accepted."
+        )
+        .trim_start()
+        .to_owned()
+        .into(),
+    );
+    tool
+}
+
 fn tool_error(msg: String) -> CallToolResult {
     CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)])
 }
@@ -2347,7 +2385,7 @@ impl ServerHandler for Proxy {
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools = local_tools();
         if let Some(c) = &self.state.read().await.connected {
-            tools.extend(c.tools.iter().cloned());
+            tools.extend(c.tools.iter().cloned().map(as_proxied));
         }
         Ok(crate::tools::catalogue(tools))
     }
@@ -2400,12 +2438,23 @@ impl ServerHandler for Proxy {
             // host that re-asks every minute spends a model turn each time.
             "wait_for_updates" => Ok(self.long_wait(request, context.ct).await?.into()),
             // A resume rotates the secret this proxy sends; the proxy has to
-            // be the one that keeps the new one (#214).
-            "resume_session" => match self.resume_in_place().await {
-                Some(Ok(value)) => Ok(CallToolResult::structured(value).into()),
-                Some(Err(said)) => Ok(tool_error(said).into()),
-                None => Ok(self.forward(request, context.ct).await?.into()),
-            },
+            // be the one that keeps the new one (#214). The lifetime is the
+            // window's, not the call's: see `as_proxied`.
+            "resume_session" => {
+                if request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("ttl_seconds"))
+                    .is_some_and(|v| !v.is_null())
+                {
+                    return Ok(tool_error(RESUME_TTL_REFUSED.to_owned()).into());
+                }
+                match self.resume_in_place().await {
+                    Some(Ok(value)) => Ok(CallToolResult::structured(value).into()),
+                    Some(Err(said)) => Ok(tool_error(said).into()),
+                    None => Ok(self.forward(request, context.ct).await?.into()),
+                }
+            }
             "post_message" => {
                 let mut request = request;
                 if let Some(channel) = self.default_channel().await {
