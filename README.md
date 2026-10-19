@@ -790,7 +790,10 @@ that is still live under a secret this window does not hold is refused, and
 the refusal says how to close it (`revoke_session` with its label, from
 another window or `ai-crew-sync client call`). `resume_session` called
 through the proxy is run by the proxy itself, which keeps the rotated
-credential and returns its description without the secret.
+credential and returns its description without the secret. If the rotated
+credential cannot open a connection, the proxy saves it, leaves the bus
+instead of serving on the refused secret, and says so; restarting the MCP
+server reconnects with it.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`

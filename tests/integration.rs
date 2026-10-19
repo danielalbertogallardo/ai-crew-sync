@@ -5875,6 +5875,167 @@ async fn resume_session_through_the_proxy_keeps_the_rotated_credential() {
     h.shutdown().await;
 }
 
+/// A front for the bus that relays every request as is, except that once a
+/// `resume_session` call has gone through it refuses the next `fail`
+/// connection handshakes (`initialize`) with a bare 503, the way a gateway
+/// does while the bus restarts. Returns its base URL and the counter.
+async fn spawn_flaky_front(
+    bus: String,
+    fail: usize,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let remaining = Arc::new(AtomicUsize::new(fail));
+    let resumed = Arc::new(AtomicBool::new(false));
+    let http = reqwest::Client::new();
+    let app = axum::Router::new().fallback({
+        let remaining = remaining.clone();
+        move |method: axum::http::Method,
+              uri: axum::http::Uri,
+              headers: axum::http::HeaderMap,
+              body: axum::body::Bytes| {
+            let (remaining, resumed, http, bus) = (
+                remaining.clone(),
+                resumed.clone(),
+                http.clone(),
+                bus.clone(),
+            );
+            async move {
+                let text = String::from_utf8_lossy(&body);
+                if text.contains("\"method\":\"initialize\"")
+                    && resumed.load(Ordering::SeqCst)
+                    && remaining
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    return axum::response::Response::builder()
+                        .status(503)
+                        .body(axum::body::Body::from("upstream unavailable"))
+                        .unwrap();
+                }
+                if text.contains("\"name\":\"resume_session\"") {
+                    resumed.store(true, Ordering::SeqCst);
+                }
+                let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+                let mut req = http.request(method, format!("{bus}{path}"));
+                for (k, v) in &headers {
+                    if k != axum::http::header::HOST && k != axum::http::header::CONTENT_LENGTH {
+                        req = req.header(k, v);
+                    }
+                }
+                let resp = req.body(body).send().await.unwrap();
+                let mut out = axum::response::Response::builder().status(resp.status());
+                for (k, v) in resp.headers() {
+                    if k != axum::http::header::CONTENT_LENGTH
+                        && k != axum::http::header::TRANSFER_ENCODING
+                    {
+                        out = out.header(k, v);
+                    }
+                }
+                out.body(axum::body::Body::from_stream(resp.bytes_stream()))
+                    .unwrap()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), remaining)
+}
+
+/// The bus rotates the secret on `resume_session` and the next handshake
+/// fails: the old connection now carries a secret the bus refuses. One
+/// failure is retried and the window carries on as the rotated credential;
+/// when the new one cannot connect at all, the window goes off the bus and
+/// says so, rather than reporting itself connected on the old secret, and
+/// a restart resumes with the new one it saved.
+#[tokio::test]
+async fn a_resume_whose_new_credential_cannot_connect_does_not_report_a_healthy_window() {
+    let h = require_db!("t_proxy_resume_flaky");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // One refused handshake after the resume: retried, and the window works.
+    let (front, _) = spawn_flaky_front(h.base.clone(), 1).await;
+    let dir = proxy_config_dir(&front, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-flaky")];
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let resumed = call(&window, "resume_session", json!({})).await;
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["epoch"], resumed["epoch"], "{who}");
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Every handshake after the resume refused: the resume happened, and
+    // the window says so and goes off the bus.
+    let (front, remaining) = spawn_flaky_front(h.base.clone(), usize::MAX).await;
+    let dir = proxy_config_dir(&front, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-stranded")];
+    let stored = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+                &dir,
+                "conv-resume-stranded",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let before = stored();
+
+    let said = call_expect_error(&window, "resume_session", json!({})).await;
+    assert!(said.contains("was resumed"), "{said}");
+    assert!(said.contains("restarted"), "says what to do: {said}");
+    // One sentence for the model; the transport's detail is the log's.
+    assert!(!said.contains("503"), "{said}");
+    assert!(!said.contains("127.0.0.1"), "{said}");
+    assert!(!said.contains("upstream unavailable"), "{said}");
+
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(
+        status["connected"], false,
+        "a window on a refused secret reported itself connected: {status}"
+    );
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was resumed"),
+        "{status}"
+    );
+    let after = stored();
+    assert_eq!(
+        after["epoch"].as_i64(),
+        before["epoch"].as_i64().map(|e| e + 1),
+        "the rotated credential was not saved: {after}"
+    );
+    assert_ne!(after["session_token"], before["session_token"]);
+    let _ = window.cancel().await;
+
+    // The bus is back: a restart resumes with the credential it saved.
+    remaining.store(0, std::sync::atomic::Ordering::SeqCst);
+    let again = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&again, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let who = call(&again, "whoami", json!({})).await;
+    assert_eq!(who["session"], before["session"], "{who}");
+    let _ = again.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 /// A host on protocol `2026-07-28` rejects a list without `ttlMs` and
 /// `cacheScope`, and a call result without `resultType`; Claude Code 2.1.281
 /// then shows the proxy connected with no tools (#192). The forwarded result
